@@ -1,7 +1,7 @@
 """
 app_multi_persona_demo-v2.py
 Ứng dụng Demo trực quan Quy trình Suy luận Đa Tác tử & Phản biện (4 Personas)
-Tương thích mọi phiên bản Streamlit & Streamlit Community Cloud.
+Tự động dò tìm model Gemini khả dụng theo API Key (tương thích mọi đời Gemini 2.5 / 3.x).
 """
 
 import os
@@ -187,10 +187,60 @@ BENCHMARK_NVDA = {
 }
 
 # ==============================================================================
-# 4. HÀM GỌI DỮ LIỆU & GEMINI API (CÓ DỰ PHÒNG ĐA TẦNG, KHÔNG BAO GIỜ LỖI IMPORT)
+# 4. HÀM DÒ TÌM MODEL KHẢ DỤNG & GỌI GEMINI API (KHÔNG BAO GIỜ LỖI 404 MODEL)
 # ==============================================================================
+def discover_gemini_models(api_key: str) -> List[str]:
+    """
+    Hỏi trực tiếp Google API xem API Key hiện tại được cấp quyền dùng những model nào.
+    Sắp xếp ưu tiên các bản Flash (2.5 -> 3.x -> các bản Flash/Pro khác).
+    """
+    clean_key = api_key.strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={clean_key}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as http_err:
+        err_body = http_err.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"API Key bị từ chối khi kiểm tra danh sách model (HTTP {http_err.code}): {err_body}")
+    except Exception as e:
+        raise RuntimeError(f"Không thể kết nối tới máy chủ Google API: {e}")
+
+    valid_models: List[str] = []
+    for m in data.get("models", []):
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods:
+            continue
+        raw_name = m.get("name", "")
+        short_name = raw_name.replace("models/", "")
+        lower_n = short_name.lower()
+        if any(skip in lower_n for skip in ["embedding", "imagen", "veo", "aqa", "tts", "robotics", "computer-use"]):
+            continue
+        valid_models.append(short_name)
+
+    if not valid_models:
+        raise RuntimeError("API Key hợp lệ nhưng không có model generateContent nào được kích hoạt trên Project này.")
+
+    def _priority(name: str) -> Tuple[int, str]:
+        ln = name.lower()
+        if ln == "gemini-2.5-flash":
+            return (0, ln)
+        if "2.5-flash" in ln and "lite" not in ln:
+            return (1, ln)
+        if "flash" in ln and "lite" not in ln and "exp" not in ln:
+            return (2, ln)
+        if "flash" in ln:
+            return (3, ln)
+        if "pro" in ln:
+            return (4, ln)
+        return (5, ln)
+
+    valid_models.sort(key=_priority)
+    return valid_models
+
+
 def fetch_financial_and_rag(company: str, ticker: str) -> Tuple[Dict[str, str], List[str]]:
-    """Bước 1: Lấy chỉ số yfinance và tìm kiếm tin tức 4 tầng (kèm từ khóa phản biện)."""
+    """Bước 1: Lấy chỉ số yfinance và tìm kiếm tin tức đa tầng (kèm từ khóa phản biện)."""
     metrics = {}
     try:
         import yfinance as yf
@@ -239,36 +289,15 @@ def fetch_financial_and_rag(company: str, ticker: str) -> Tuple[Dict[str, str], 
     return metrics, snippets
 
 
-def call_gemini_llm(api_key: str, system_prompt: str, user_prompt: str) -> str:
+def call_gemini_rest(api_key: str, model_candidates: List[str], system_prompt: str, user_prompt: str) -> Tuple[str, str]:
     """
-    Gọi Gemini 2.5 Flash (temperature=0.2).
-    Ưu tiên LangChain nếu có, tự động chuyển sang REST API chuẩn nếu thiếu thư viện.
+    Gọi thẳng Gemini REST API theo danh sách model thực tế của API Key.
+    Trả về (nội_dung_trả_lời, tên_model_đã_chạy_thành_công).
     """
     clean_key = api_key.strip()
-    # Cách 1: Dùng LangChain (giống repo gốc)
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        from langchain_core.messages import SystemMessage, HumanMessage
+    last_error = ""
 
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            google_api_key=clean_key,
-            temperature=0.2,
-        )
-        res = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ])
-        return str(res.content)
-    except ImportError:
-        pass
-    except Exception as lc_err:
-        # Nếu lỗi không phải do sai API key thì thử fallback REST API
-        if "API_KEY_INVALID" in str(lc_err) or "API key not valid" in str(lc_err):
-            raise RuntimeError("Google API Key không hợp lệ. Vui lòng kiểm tra lại khóa của bạn.")
-
-    # Cách 2: Gọi thẳng REST API của Gemini (không phụ thuộc thư viện ngoài)
-    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    for model_name in model_candidates:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -284,14 +313,23 @@ def call_gemini_llm(api_key: str, system_prompt: str, user_prompt: str) -> str:
         try:
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    last_error = f"Model {model_name} không trả về nội dung (có thể bị bộ lọc an toàn chặn)."
+                    continue
+                text = candidates[0]["content"]["parts"][0]["text"]
+                return text, model_name
         except urllib.error.HTTPError as http_err:
             err_body = http_err.read().decode("utf-8", errors="ignore")
-            if http_err.code == 404:
+            last_error = f"[{model_name}] HTTP {http_err.code}: {err_body}"
+            if http_err.code in (404, 429, 503):
                 continue
-            raise RuntimeError(f"Lỗi Gemini API ({http_err.code}): {err_body}")
+            raise RuntimeError(last_error)
+        except Exception as exc:
+            last_error = f"[{model_name}] Lỗi kết nối: {exc}"
+            continue
 
-    raise RuntimeError("Không thể kết nối tới mô hình Gemini. Vui lòng kiểm tra kết nối mạng hoặc API Key.")
+    raise RuntimeError(f"Đã thử các model {model_candidates[:4]} nhưng đều thất bại. Chi tiết lỗi cuối: {last_error}")
 
 
 def render_pipeline_tracker(placeholder, step_states: List[Dict[str, str]]):
@@ -323,13 +361,12 @@ st.markdown(
     """
     <div class="top-banner">
         <h2>🧠 Demo Hệ thống Đa Tác tử & Phản biện (4-Persona Reasoning)</h2>
-        <p>Nhập mã cổ phiếu & Google API Key bên dưới, sau đó bấm nút Chạy để theo dõi từng bước xử lý và kết quả của 4 Persona.</p>
+        <p>Tự động nhận diện model Gemini khả dụng trên API Key của bạn (2.5 / 3.x), theo dõi tiến trình 5 bước và xuất báo cáo 4 Persona.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# Lấy sẵn API key từ môi trường hoặc Streamlit Secrets nếu đã cấu hình
 default_api_key = os.environ.get("GOOGLE_API_KEY", "")
 if not default_api_key:
     try:
@@ -337,10 +374,9 @@ if not default_api_key:
     except Exception:
         default_api_key = ""
 
-# Khu vực nhập liệu nằm ngay trên màn hình chính
-c_in1, c_in2, c_in3 = st.columns([1.2, 0.8, 2.0])
+c_in1, c_in2, c_in3, c_in4 = st.columns([1.1, 0.7, 1.8, 1.1])
 with c_in1:
-    company_input = st.text_input("Tên công ty:", value="NVIDIA", placeholder="VD: NVIDIA, Apple, Tesla...")
+    company_input = st.text_input("Tên công ty:", value="NVIDIA", placeholder="VD: NVIDIA, Apple...")
 with c_in2:
     ticker_input = st.text_input("Mã cổ phiếu:", value="NVDA", placeholder="VD: NVDA, AAPL...").upper().strip()
 with c_in3:
@@ -350,8 +386,13 @@ with c_in3:
         type="password",
         placeholder="Dán khóa AIzaSy... vào đây",
     )
+with c_in4:
+    custom_model_input = st.text_input(
+        "Model ưu tiên (Tùy chọn):",
+        value="Tự động dò từ Key",
+        help="Để mặc định để hệ thống tự lấy model đang bật trên API Key của bạn (VD: gemini-2.5-flash hoặc gemini-3-flash-preview).",
+    )
 
-# Hai nút chạy lớn nằm ngay dưới ô nhập liệu
 b_col1, b_col2 = st.columns([1.4, 1])
 with b_col1:
     run_live_btn = st.button(
@@ -367,7 +408,6 @@ with b_col2:
 
 st.markdown("---")
 
-# Các vùng hiển thị động theo thời gian thực
 tracker_placeholder = st.empty()
 metrics_placeholder = st.empty()
 rag_placeholder = st.empty()
@@ -378,7 +418,6 @@ card2_placeholder = col_p2.empty()
 card3_placeholder = col_p3.empty()
 lead_placeholder = st.empty()
 
-# Khởi tạo trạng thái lưu kết quả gần nhất
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
 
@@ -392,7 +431,7 @@ if run_live_btn or run_demo_btn:
         st.error("⚠️ Bạn chưa nhập **Google API Key**. Hãy dán khóa vào ô phía trên hoặc bấm nút **CHẠY MẪU NVDA** bên cạnh.")
     else:
         steps = [
-            {"title": "Bước 1/5: Thu thập dữ liệu tài chính & Tìm kiếm tin tức đa tầng", "desc": "Lấy chỉ số từ Yahoo Finance và truy vấn tin tức tích cực + tiêu cực (issues, concerns, investigation).", "state": "wait"},
+            {"title": "Bước 1/5: Kiểm tra Model Gemini & Thu thập dữ liệu tài chính + RAG đa tầng", "desc": "Xác thực model khả dụng từ API Key, lấy chỉ số Yahoo Finance và tin tức tích cực + tiêu cực.", "state": "wait"},
             {"title": "Bước 2/5: Persona 1 — Market Investor (generate_market_outlook)", "desc": "Phân tích động lượng giá, xu hướng ngành & tâm lý ngắn hạn [Ngữ cảnh cô lập #1].", "state": "wait"},
             {"title": "Bước 3/5: Persona 2 — Value Investor (generate_value_analysis)", "desc": "Đánh giá giá trị nội tại, lợi thế cạnh tranh (Moat) & Biên an toàn [Ngữ cảnh cô lập #2].", "state": "wait"},
             {"title": "Bước 4/5: Persona 3 — Devil’s Advocate (generate_devils_advocate_view)", "desc": "Khai thác tin tiêu cực để phản biện & stress-test rủi ro [Ngữ cảnh cô lập #3].", "state": "wait"},
@@ -405,12 +444,21 @@ if run_live_btn or run_demo_btn:
             render_pipeline_tracker(tracker_placeholder, steps)
             t0 = time.perf_counter()
 
+            model_candidates: List[str] = []
             if is_live:
+                discovered = discover_gemini_models(api_key_input)
+                user_m = custom_model_input.strip()
+                if user_m and user_m != "Tự động dò từ Key":
+                    model_candidates = [user_m] + [m for m in discovered if m != user_m]
+                else:
+                    model_candidates = discovered
+
                 cur_company = company_input.strip() or ticker_input
                 cur_ticker = ticker_input or "NVDA"
                 metrics, snippets = fetch_financial_and_rag(cur_company, cur_ticker)
+                steps[0]["desc"] = f"Đã tìm thấy {len(model_candidates)} model trên Key (Ưu tiên: {model_candidates[0]})."
             else:
-                time.sleep(0.45)
+                time.sleep(0.4)
                 cur_company = BENCHMARK_NVDA["company"]
                 cur_ticker = BENCHMARK_NVDA["ticker"]
                 metrics = BENCHMARK_NVDA["metrics"]
@@ -420,7 +468,6 @@ if run_live_btn or run_demo_btn:
             steps[0]["time"] = f"{time.perf_counter() - t0:.2f}s"
             render_pipeline_tracker(tracker_placeholder, steps)
 
-            # Hiển thị ngay chỉ số tài chính & nguồn RAG vừa thu thập
             with metrics_placeholder.container():
                 st.markdown(f"#### 📊 Dữ liệu đầu vào dùng chung cho **{cur_company} ({cur_ticker})**")
                 m_cols = st.columns(len(metrics))
@@ -428,6 +475,8 @@ if run_live_btn or run_demo_btn:
                     m_cols[idx].metric(k, v)
 
             with rag_placeholder.expander("📄 Xem các mảnh dữ liệu RAG vừa thu thập (Dùng chung cho 3 Persona)", expanded=False):
+                if is_live:
+                    st.caption(f"Danh sách model khả dụng trên API Key của bạn: `{', '.join(model_candidates[:8])}`")
                 for s in snippets:
                     st.write(f"- {s}")
 
@@ -435,24 +484,27 @@ if run_live_btn or run_demo_btn:
             rag_text = "\n".join(snippets)
             shared_human_prompt = f"Công ty: {cur_company} ({cur_ticker})\n\nChỉ số tài chính:\n{fin_text}\n\nDữ liệu tin tức & báo cáo thu thập được:\n{rag_text}"
 
+            used_model_name = "Benchmark Mode"
+
             # ---------------- BƯỚC 2: MARKET INVESTOR ----------------
             steps[1]["state"] = "running"
             render_pipeline_tracker(tracker_placeholder, steps)
             t1 = time.perf_counter()
 
             if is_live:
-                market_out = call_gemini_llm(
+                raw_m, used_model_name = call_gemini_rest(
                     api_key_input,
+                    model_candidates,
                     PROMPTS["market"].format(company=cur_company, ticker=cur_ticker),
                     shared_human_prompt,
                 )
-                market_out = f"### 🟢 1. Market Investor (Ngắn hạn)\n{market_out}"
+                market_out = f"### 🟢 1. Market Investor (Ngắn hạn)\n{raw_m}"
             else:
-                time.sleep(0.55)
+                time.sleep(0.45)
                 market_out = BENCHMARK_NVDA["market"]
 
             steps[1]["state"] = "done"
-            steps[1]["time"] = f"{time.perf_counter() - t1:.2f}s"
+            steps[1]["time"] = f"{time.perf_counter() - t1:.2f}s | {used_model_name}"
             render_pipeline_tracker(tracker_placeholder, steps)
             card1_placeholder.markdown(
                 f"<div class='persona-card card-market'><span class='badge'>Ngữ cảnh cô lập #1</span>\n\n{market_out}</div>",
@@ -465,18 +517,19 @@ if run_live_btn or run_demo_btn:
             t2 = time.perf_counter()
 
             if is_live:
-                value_out = call_gemini_llm(
+                raw_v, used_model_name = call_gemini_rest(
                     api_key_input,
+                    model_candidates,
                     PROMPTS["value"].format(company=cur_company, ticker=cur_ticker),
                     shared_human_prompt,
                 )
-                value_out = f"### 🔵 2. Value Investor (Dài hạn)\n{value_out}"
+                value_out = f"### 🔵 2. Value Investor (Dài hạn)\n{raw_v}"
             else:
-                time.sleep(0.55)
+                time.sleep(0.45)
                 value_out = BENCHMARK_NVDA["value"]
 
             steps[2]["state"] = "done"
-            steps[2]["time"] = f"{time.perf_counter() - t2:.2f}s"
+            steps[2]["time"] = f"{time.perf_counter() - t2:.2f}s | {used_model_name}"
             render_pipeline_tracker(tracker_placeholder, steps)
             card2_placeholder.markdown(
                 f"<div class='persona-card card-value'><span class='badge'>Ngữ cảnh cô lập #2</span>\n\n{value_out}</div>",
@@ -489,18 +542,19 @@ if run_live_btn or run_demo_btn:
             t3 = time.perf_counter()
 
             if is_live:
-                devil_out = call_gemini_llm(
+                raw_d, used_model_name = call_gemini_rest(
                     api_key_input,
+                    model_candidates,
                     PROMPTS["devil"].format(company=cur_company, ticker=cur_ticker),
                     shared_human_prompt,
                 )
-                devil_out = f"### 🔴 3. Devil’s Advocate (Phản biện)\n{devil_out}"
+                devil_out = f"### 🔴 3. Devil’s Advocate (Phản biện)\n{raw_d}"
             else:
-                time.sleep(0.55)
+                time.sleep(0.45)
                 devil_out = BENCHMARK_NVDA["devil"]
 
             steps[3]["state"] = "done"
-            steps[3]["time"] = f"{time.perf_counter() - t3:.2f}s"
+            steps[3]["time"] = f"{time.perf_counter() - t3:.2f}s | {used_model_name}"
             render_pipeline_tracker(tracker_placeholder, steps)
             card3_placeholder.markdown(
                 f"<div class='persona-card card-devil'><span class='badge'>Ngữ cảnh cô lập #3</span>\n\n{devil_out}</div>",
@@ -519,18 +573,19 @@ if run_live_btn or run_demo_btn:
                     f"--- BÁO CÁO 2: VALUE INVESTOR ---\n{value_out}\n\n"
                     f"--- BÁO CÁO 3: DEVIL'S ADVOCATE ---\n{devil_out}"
                 )
-                lead_raw = call_gemini_llm(
+                lead_raw, used_model_name = call_gemini_rest(
                     api_key_input,
+                    model_candidates,
                     PROMPTS["lead"].format(company=cur_company, ticker=cur_ticker),
                     lead_input,
                 )
                 lead_out = f"### 🟡 4. Lead Analyst — Kết luận Đồng thuận Cuối cùng\n{lead_raw}"
             else:
-                time.sleep(0.55)
+                time.sleep(0.45)
                 lead_out = BENCHMARK_NVDA["lead"]
 
             steps[4]["state"] = "done"
-            steps[4]["time"] = f"{time.perf_counter() - t4:.2f}s"
+            steps[4]["time"] = f"{time.perf_counter() - t4:.2f}s | {used_model_name}"
             render_pipeline_tracker(tracker_placeholder, steps)
             lead_placeholder.markdown(
                 f"<div class='card-lead'><span class='badge'>Tổng hợp từ 3 báo cáo độc lập</span>\n\n{lead_out}</div>",
@@ -548,12 +603,11 @@ if run_live_btn or run_demo_btn:
                 "devil": devil_out,
                 "lead": lead_out,
             }
-            st.success(f"✅ Hoàn tất toàn bộ quy trình 5 bước cho {cur_company} ({cur_ticker})!")
+            st.success(f"✅ Hoàn tất toàn bộ quy trình 5 bước cho {cur_company} ({cur_ticker}) bằng model `{used_model_name}`!")
 
         except Exception as exc:
             st.error(f"❌ Quá trình chạy gặp lỗi: {exc}")
 
-# Giữ lại kết quả trên màn hình nếu người dùng thao tác mở/đóng expander sau khi chạy
 elif st.session_state["last_result"] is not None:
     saved = st.session_state["last_result"]
     render_pipeline_tracker(tracker_placeholder, saved["steps"])
